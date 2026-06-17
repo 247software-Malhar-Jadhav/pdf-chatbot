@@ -12,6 +12,9 @@ export const maxDuration = 60;
 
 type IncomingMessage = { role: "user" | "assistant"; content: string };
 
+// ── STEP 7a (prompt template) — THE GROUNDING INSTRUCTION ──────────────────
+// {fileName} and {context} are filled at request time. The "use ONLY the
+// excerpts / say you couldn't find it" rule is what stops hallucination.
 const SYSTEM_PROMPT = `You are a helpful assistant that answers questions about an uploaded PDF document ("{fileName}").
 
 Use ONLY the context excerpts below to answer the user's question. The PDF can be about anything — legal contracts, research papers, manuals, reports, invoices, etc.
@@ -28,11 +31,12 @@ Context excerpts from the document:
 
 export async function POST(req: NextRequest) {
   try {
-    if (!process.env.GROQ_API_KEY) {
+    const groqKey = process.env.GROQ_API_KEY?.trim();
+    if (!groqKey || groqKey === "your_groq_api_key_here") {
       return NextResponse.json(
         {
           error:
-            "GROQ_API_KEY is not set. Copy .env.local.example to .env.local and add your free Groq key.",
+            "No valid GROQ_API_KEY found. Get a free key at https://console.groq.com/keys and put it in .env.local (it should start with 'gsk_'), then restart the server.",
         },
         { status: 500 }
       );
@@ -54,6 +58,7 @@ export async function POST(req: NextRequest) {
       );
     }
 
+    // ── STEP 5 — RETRIEVE relevant chunks for this question (see lib/store.ts).
     const retrieved = await retrieveContext(sessionId, lastUser.content, 5);
     if (!retrieved) {
       return NextResponse.json(
@@ -62,14 +67,18 @@ export async function POST(req: NextRequest) {
       );
     }
 
+    // ── STEP 7b — THE LLM (AI COMPONENT #2). Groq-hosted Llama 3.3.
+    // temperature 0.2 = factual/consistent (not creative); streaming = token-by-token.
     const model = new ChatGroq({
-      apiKey: process.env.GROQ_API_KEY,
+      apiKey: groqKey,
       model: process.env.GROQ_MODEL || "llama-3.3-70b-versatile",
       temperature: 0.2,
       streaming: true,
     });
 
-    // Pass prior turns (excluding the last user msg) as conversation history.
+    // ── STEP 6c — CONVERSATION CONTEXT. The browser re-sends the full history
+    // each request; here we turn prior turns into LangChain messages so the LLM
+    // understands follow-ups ("who signed it?" knows what "it" is).
     const history = messages
       .slice(0, messages.lastIndexOf(lastUser))
       .map((m) =>
@@ -78,21 +87,26 @@ export async function POST(req: NextRequest) {
           : new AIMessage(m.content)
       );
 
+    // ── STEP 7a — BUILD THE PROMPT: system rules + retrieved excerpts,
+    // then history, then the new question. The SYSTEM_PROMPT (top of file) is
+    // what grounds answers in the PDF and forbids making things up.
     const prompt = ChatPromptTemplate.fromMessages([
       ["system", SYSTEM_PROMPT],
       new MessagesPlaceholder("history"),
       ["human", "{question}"],
     ]);
 
+    // ── STEP 7c — RUN THE CHAIN (LCEL): fill prompt -> send to LLM -> stream tokens.
     const chain = prompt.pipe(model);
 
     const stream = await chain.stream({
       fileName: retrieved.fileName,
-      context: retrieved.context,
+      context: retrieved.context, // the 5 retrieved excerpts fill {context}
       history,
       question: lastUser.content,
     });
 
+    // ── STEP 7d — STREAM tokens to the browser as plain text as they arrive.
     const encoder = new TextEncoder();
     const readable = new ReadableStream({
       async start(controller) {

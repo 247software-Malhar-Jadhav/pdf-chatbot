@@ -31,9 +31,11 @@ export async function POST(req: NextRequest) {
       );
     }
 
+    // ── STEP 1 — PDF -> TEXT. Reads the PDF's text layer (lib/pdf.ts).
     const buffer = Buffer.from(await file.arrayBuffer());
     const { text, numPages } = await extractPdfText(buffer);
 
+    // A scanned/image-only PDF has no text layer -> reject (would need OCR).
     if (!text || text.length < 10) {
       return NextResponse.json(
         {
@@ -44,6 +46,7 @@ export async function POST(req: NextRequest) {
       );
     }
 
+    // ── STEPS 2-4 — chunk -> embed -> store in memory (lib/store.ts).
     const { numChunks } = await ingestPdf({
       sessionId,
       fileName: file.name,

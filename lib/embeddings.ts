@@ -9,6 +9,11 @@ import { Embeddings, type EmbeddingsParams } from "@langchain/core/embeddings";
  *
  * Default model: Xenova/all-MiniLM-L6-v2 (384-dim, fast, solid quality).
  */
+// ═════════════════════════════════════════════════════════════════════════
+// AI COMPONENT #1 — THE EMBEDDING MODEL (runs locally, free).
+// Converts text into 384-dimensional vectors that capture *meaning*.
+// Used in two places: indexing the PDF (upload) and embedding the question (chat).
+// ═════════════════════════════════════════════════════════════════════════
 export class LocalEmbeddings extends Embeddings {
   private modelName: string;
   // The transformers.js pipeline is lazily created once and reused.
@@ -24,9 +29,14 @@ export class LocalEmbeddings extends Embeddings {
       "Xenova/all-MiniLM-L6-v2";
   }
 
+  // ═══════════════════════════════════════════════════════════════════════
+  // STEP 3e — Load the model ONCE, reuse forever.
+  // The ~25MB model downloads on first use, caches to disk, and runs locally
+  // on the CPU (no API key, no per-call cost). `extractorPromise` memoises it.
+  // The dynamic import() keeps this Node-only package out of the browser bundle.
+  // ═══════════════════════════════════════════════════════════════════════
   private async getExtractor() {
     if (!this.extractorPromise) {
-      // Dynamic import keeps this Node-only dependency out of the client bundle.
       this.extractorPromise = import("@huggingface/transformers").then(
         ({ pipeline }) => pipeline("feature-extraction", this.modelName)
       );
@@ -34,22 +44,35 @@ export class LocalEmbeddings extends Embeddings {
     return this.extractorPromise;
   }
 
-  /** Embed a batch of documents. */
+  // ═══════════════════════════════════════════════════════════════════════
+  // STEP 3 (UPLOAD) — Turn many chunks into many vectors.
+  // Called by MemoryVectorStore.fromDocuments() during ingestion.
+  // ═══════════════════════════════════════════════════════════════════════
   async embedDocuments(texts: string[]): Promise<number[][]> {
     const extractor = await this.getExtractor();
     const vectors: number[][] = [];
     // Process sequentially to keep memory predictable for large PDFs.
     for (const text of texts) {
+      // Inside extractor(): (3a) tokenize text -> token IDs,
+      // (3b) run the 6-layer model -> one vector per token.
       const output = await extractor(text, {
+        // STEP 3c — pooling+normalize: average the per-token vectors into ONE
+        // 384-d vector ("mean"), then scale it to length 1 ("normalize") so
+        // cosine similarity later becomes a simple, length-independent dot product.
         pooling: "mean",
         normalize: true,
       });
+      // The Float32Array of 384 numbers IS the embedding for this chunk.
       vectors.push(Array.from(output.data as Float32Array));
     }
     return vectors;
   }
 
-  /** Embed a single query string. */
+  // ═══════════════════════════════════════════════════════════════════════
+  // STEP 3 (CHAT) — Turn ONE question into ONE vector.
+  // Uses the SAME model as embedDocuments, so the question and the chunks live
+  // in the same 384-d space and can be meaningfully compared (see STEP 5).
+  // ═══════════════════════════════════════════════════════════════════════
   async embedQuery(text: string): Promise<number[]> {
     const extractor = await this.getExtractor();
     const output = await extractor(text, {

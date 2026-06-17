@@ -11,7 +11,9 @@ type DocInfo = {
   chars: number;
 };
 
-// Generate a stable per-tab session id (no external dep needed on the client).
+// ── STEP 6b — SESSION ID. Generated once per browser tab and sent with every
+// request. The server uses it to key this tab's PDF vectors (lib/store.ts).
+// Not persisted: a page refresh makes a new id, so the PDF must be re-uploaded.
 function makeSessionId() {
   return "sess-" + Math.random().toString(36).slice(2) + Date.now().toString(36);
 }
@@ -93,6 +95,8 @@ export default function PdfChat() {
     setMessages((m) => [...m, { role: "assistant", content: "" }]);
 
     try {
+      // STEP 6c — send the FULL message history so the server can give the LLM
+      // conversation context (the server keeps no chat memory of its own).
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -104,6 +108,8 @@ export default function PdfChat() {
         throw new Error(data.error || "Failed to get a response.");
       }
 
+      // STEP 7e — read the streamed tokens and append them live, producing the
+      // word-by-word "typing" effect (mirror of STEP 7d on the server).
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
       let acc = "";
