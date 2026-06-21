@@ -37,7 +37,15 @@ export class LocalEmbeddings extends Embeddings {
   // ═══════════════════════════════════════════════════════════════════════
   private async getExtractor() {
     if (!this.extractorPromise) {
-      this.extractorPromise = import("@huggingface/transformers").then(
+      // The specifier is hidden behind a runtime-built import so bundlers
+      // (Next's file tracer / Vercel) do NOT pull this heavy, native-binary
+      // package into the serverless function. It's only needed for the LOCAL /
+      // Render path; on Vercel the Upstash backend does embeddings instead.
+      const dynImport: (m: string) => Promise<any> = new Function(
+        "m",
+        "return import(m)"
+      ) as any;
+      this.extractorPromise = dynImport("@huggingface/transformers").then(
         ({ pipeline }) => pipeline("feature-extraction", this.modelName)
       );
     }
