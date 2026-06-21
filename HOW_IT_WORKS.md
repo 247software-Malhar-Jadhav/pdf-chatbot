@@ -221,81 +221,155 @@ Set in `.env.local` (only the key is required):
 
 ---
 
-## 11. Limitations (be upfront about these)
+## 11. Constraints & Assumptions (with concrete numbers)
 
-- **Scanned/image PDFs** aren't supported (no text layer; needs OCR).
-- **In-memory store** → data resets on server restart; not multi-server scalable.
-- **Per-tab sessions** → refreshing the page requires re-uploading.
-- **Groq free-tier rate limits** apply under heavy use.
-- **Answer quality** depends on retrieval — if the right chunk isn't in the top 5, the answer may be incomplete (tune `chunkSize` / `k`).
-- **Embeddings need a Node runtime with disk** → not ideal for read-only serverless; use a hosted embedding provider there.
+### 11.1 Hard numbers — the actual limits
+
+| Thing | Value | Where it comes from |
+| --- | --- | --- |
+| **Chunk size** | **1000 characters** | `RecursiveCharacterTextSplitter` in `lib/store.ts` |
+| **Chunk overlap** | **150 characters** | same — so each chunk adds ~850 *new* chars |
+| **Chunks per document** | ≈ `totalChars / 850` | e.g. 2,126 chars → 3 chunks; 39,000 chars → ~46 chunks |
+| **Minimum extractable text** | **10 characters** | below this the PDF is rejected as scanned (`ingest/route.ts`) |
+| **Embedding vector size** | **384 numbers** | the `all-MiniLM-L6-v2` model |
+| **Embedding model input cap** | **~256 tokens (~1,000 chars)** | model limit — text beyond this in a chunk is truncated; this is *why* chunk size is 1,000 |
+| **Chunks retrieved per question** | **5** (`k = 5`) | `retrieveContext(..., 5)` in `chat/route.ts` |
+| **Context sent to the LLM** | ~5 chunks ≈ **5,000 chars ≈ ~1,250 tokens** | top-5 excerpts + prompt + history |
+| **LLM context window** | **128,000 tokens** | Llama 3.3 70B on Groq — we use a tiny fraction |
+| **LLM temperature** | **0.2** | `chat/route.ts` (low = factual) |
+| **Route time budget** | **60 s** (`maxDuration = 60`) | a hint; ignored on a persistent host like Render |
+| **PDF file size** | **No hard limit in code** | bounded by server RAM + patience (see below) |
+| **Practical PDF size** | comfortably **up to ~hundreds of pages** | limited by the host's memory, not the code |
+
+### 11.2 Soft / environmental constraints
+
+- **Server memory** is the real ceiling. On **Render free tier (512 MB RAM)** the embedding model + Node runtime use a few hundred MB; very large PDFs (thousands of pages) can hit the limit. Each stored vector is tiny (~3 KB), so vectors aren't the bottleneck — the model + runtime are.
+- **No eviction / TTL on sessions.** Every upload's vectors stay in RAM until the server restarts. Many uploads in one server lifetime accumulate memory.
+- **Sequential embedding.** Chunks are embedded one-by-one in a single Node process, so a huge PDF or many simultaneous uploads index slower.
+- **Cold start (Render free).** Instance sleeps after ~15 min idle; first request after that takes **~30–50 s** (wake + one-time model download ~25 MB). Observed: a first upload took **~28 s**; subsequent ones ~1–2 s.
+- **Groq free-tier rate limits** (approximate, subject to change — check `console.groq.com/settings/limits`): on the order of **~30 requests/min** and a **per-minute/day token cap**. Heavy use returns `429`.
+- **Single server.** In-memory state means it does **not** scale across multiple instances (one instance wouldn't see another's uploads).
+
+### 11.3 Assumptions (what must be true for it to work)
+
+- **The PDF has a real text layer** (not a scan/photo). Scanned/image-only PDFs extract 0 chars and are rejected — no OCR.
+- **The answer lives in the top-5 retrieved chunks.** If the relevant passage isn't among the 5 nearest, the answer may be incomplete (tune `chunkSize`/`k`).
+- **Mostly English text.** `all-MiniLM-L6-v2` is English-optimised; other languages work but retrieval quality may drop.
+- **One long-lived server process** (Render/Railway/VM), since the store is in-memory — *not* serverless (Vercel).
+- **The browser tab stays open.** Session id + chat history live in the tab; a refresh starts fresh and needs a re-upload.
+- **Network is available** to reach Groq (every answer) and, on first run, the Hugging Face CDN (model download).
+- **A valid `GROQ_API_KEY`** is set and within rate limits.
 
 ---
 
 ## 12. ❓ Q&A bank — answer anything about it
 
+> Each answer ends with **📌 Constraints/assumptions** so you can defend the answer
+> and state its limits. Numbers are summarised in §11.
+
 **Q: In one sentence, what does it do?**
 Upload any PDF and ask questions; it retrieves the relevant passages and an AI answers from them (RAG).
+📌 *Assumes the PDF has a text layer; only the top-5 relevant passages are used per answer.*
 
 **Q: What is RAG?**
 Retrieval-Augmented Generation — instead of asking the LLM blindly, you first *retrieve* relevant text from your data and give it to the LLM so the answer is grounded and accurate.
+📌 *Constraint: answer quality is capped by retrieval — if the right chunk isn't retrieved, the LLM can't use it.*
 
 **Q: Which AI models are used?**
-Two: (1) a **local** embedding model `all-MiniLM-L6-v2` for turning text into vectors, and (2) **Groq's Llama 3.3 70B** in the cloud for writing answers.
+Two: (1) a **local** embedding model `all-MiniLM-L6-v2` (384-dim, ~256-token input cap), and (2) **Groq's Llama 3.3 70B** (128k-token context) in the cloud for writing answers.
+📌 *Assumes a Node server with disk for the local model + network access to Groq.*
 
 **Q: Is it really free?**
 Yes. Embeddings run locally at no cost. Groq has a free API tier (no credit card). No database to pay for.
+📌 *Constraint: Groq free tier has rate limits (~30 req/min + token caps); Render free tier has 512 MB RAM and sleeps when idle.*
+
+**Q: How big a PDF can I upload? How many characters/pages?**
+There is **no hard size limit in the code** — any PDF is accepted. The practical limit is **server memory and patience**, not a fixed number: on Render's 512 MB free tier it comfortably handles documents up to **roughly a few hundred pages**. Text is what matters, not file size: each ~1,000 characters becomes one chunk, and each chunk is a tiny 384-number vector (~3 KB), so even a 300-page doc (~750k chars → ~880 chunks) is only ~3 MB of vectors. The real cost is the embedding model + Node runtime (~a few hundred MB) and indexing time.
+📌 *Constraint: bounded by host RAM (512 MB on Render free), no enforced max; very large PDFs may OOM or index slowly. Minimum: must extract ≥10 characters or it's rejected as scanned.*
+
+**Q: How many chunks will my PDF become?**
+Roughly **`total_characters / 850`** (1,000-char chunks minus 150-char overlap). Examples seen in testing: 1,331 chars → 2 chunks, 2,126 chars → 3 chunks, ~39,000 chars → ~46 chunks.
+📌 *Constraint: fixed by `chunkSize: 1000` / `chunkOverlap: 150` in `lib/store.ts`; change there to re-tune.*
 
 **Q: What's an embedding / vector?**
-A list of 384 numbers that represents the *meaning* of a piece of text. Texts with similar meaning produce vectors that are close together, which is how we "search by meaning" instead of by keyword.
+A list of **384 numbers** that represents the *meaning* of a piece of text. Texts with similar meaning produce vectors that are close together, which is how we "search by meaning" instead of by keyword.
+📌 *Constraint: the model embeds at most ~256 tokens (~1,000 chars) per call — longer text is truncated, which is exactly why chunks are capped at 1,000 chars.*
 
 **Q: How are tokens created?**
 The embedding model's tokenizer (WordPiece) splits text into sub-word units from a ~30k-word vocabulary and maps them to numeric IDs before the model processes them. (Details in AI_FLOW.md §3.)
+📌 *Constraint: max ~256 tokens per embedding input; English-optimised vocabulary.*
 
 **Q: How does it find the right answer in the PDF?**
-It embeds your question into the same vector space as the chunks, then uses **cosine similarity** to find the 5 chunks whose vectors are closest, and sends those to the LLM.
+It embeds your question into the same vector space as the chunks, then uses **cosine similarity** to find the **5** chunks whose vectors are closest, and sends those to the LLM.
+📌 *Constraint: `k = 5`; assumes the answer is within those 5. Raise `k` for broad questions, but that sends more tokens to the LLM.*
 
 **Q: Why split the PDF into chunks?**
-Embedding models have input-length limits, and retrieval is more precise on small pieces. The 150-char overlap prevents losing a fact that sits on a chunk boundary.
+Embedding models have input-length limits (~256 tokens here), and retrieval is more precise on small pieces. The 150-char overlap prevents losing a fact that sits on a chunk boundary.
+📌 *Assumption: relevant facts fit within a ~1,000-char window; facts spread across many distant pages may need a higher `k`.*
+
+**Q: How much data is actually sent to the cloud (Groq) per question?**
+Only the **5 retrieved excerpts (~5,000 chars ≈ ~1,250 tokens) + your question + the chat history** — never the whole PDF. That's well under Llama 3.3's 128k-token context.
+📌 *Constraint: long conversations grow the history sent each turn, which counts toward Groq's per-minute token cap.*
 
 **Q: Does my PDF get uploaded to OpenAI/Groq/the cloud?**
 No. The PDF is parsed and embedded **locally**. Only the few **retrieved excerpts + your question** go to Groq to generate each answer — never the whole document.
+📌 *Assumption: "local" means on the server running the app. Groq still sees the excerpts you ask about. For zero egress, swap to a local LLM (Ollama).*
 
 **Q: Where is my data stored? Is there a database?**
 No database. The PDF's vectors live in the server's RAM (keyed by a random session id). The uploaded file is never written to disk. Everything clears on restart.
+📌 *Constraint: in-memory, no persistence, no eviction — vectors accumulate until the process restarts.*
 
 **Q: Why do I have to re-upload after refreshing or restarting?**
-The session id is per browser tab (lost on refresh), and the vector store is in-memory (lost on server restart). It's a demo-friendly, zero-config design; a real deployment would use a persistent vector DB + stable sessions.
+The session id is per browser tab (lost on refresh), and the vector store is in-memory (lost on server restart, including Render's idle sleep). It's a demo-friendly, zero-config design.
+📌 *Constraint: no durable storage + per-tab sessions. Fix with a persistent vector DB + stable auth/session.*
 
 **Q: How does it remember earlier messages in the chat?**
 It doesn't, server-side. The browser keeps the chat history and re-sends it with each question; the server passes it to the LLM as conversation context.
+📌 *Constraint: history lives only in the tab and grows the token cost of each request; cleared on refresh / "New PDF".*
 
 **Q: How does streaming work?**
 Groq streams tokens as it generates them; the server re-emits them as an HTTP stream; the browser reads the stream and appends each token, producing the live "typing" effect.
+📌 *Assumption: the host supports streaming responses (Render does; serverless platforms vary).*
 
 **Q: Why doesn't it hallucinate / make things up?**
 The system prompt instructs the model to answer **only** from the provided excerpts and to say it couldn't find the answer otherwise. Low `temperature` (0.2) also keeps it factual.
+📌 *Constraint: grounding is best-effort, not guaranteed — an LLM can still err; it only sees the 5 retrieved chunks, not the whole doc.*
 
 **Q: What if the PDF is a scanned image?**
-There's no text to extract, so it's rejected with a clear message. Supporting scans would require adding OCR (e.g. Tesseract) before chunking.
+There's no text to extract, so it's rejected (needs ≥10 extractable chars) with a clear message. Supporting scans would require adding OCR (e.g. Tesseract) before chunking.
+📌 *Assumption: input PDFs have a digital text layer.*
 
-**Q: Can it handle large PDFs?**
-Yes within reason — more pages just mean more chunks/vectors in RAM. Very large PDFs use more memory and take longer to index. Retrieval still only sends the top 5 chunks per question.
+**Q: Can it handle large PDFs / what's the bottleneck?**
+Yes within reason — more pages just mean more chunks/vectors in RAM and longer indexing. The bottleneck is **server RAM** (512 MB on Render free) and the **sequential, one-by-one embedding**, not the vector storage. Retrieval still sends only the top 5 chunks per question regardless of size.
+📌 *Constraint: ~hundreds of pages on free tier; thousands may OOM. First index after a cold start is slow (~30 s).*
+
+**Q: What are the speed numbers?**
+First upload after a cold start: **~30 s** (wake + one-time ~25 MB model download). After warm-up: indexing a small PDF ~1–2 s; each answer streams in a few seconds depending on length.
+📌 *Constraint: Render free instance sleeps after ~15 min idle, so the cold-start cost recurs.*
 
 **Q: How would I make this production-ready?**
-Swap the in-memory store for a persistent vector DB, add user auth + stable sessions, add OCR for scans, and consider a managed embedding service if deploying serverless. (README §"Going to production".)
+Swap the in-memory store for a persistent vector DB, add user auth + stable sessions, add OCR for scans, add session eviction/TTL, and consider a managed embedding service if deploying serverless. (README §"Going to production".)
+📌 *Assumption: current design targets a demo / single server, not multi-tenant scale.*
 
 **Q: Can it run fully offline / on-prem?**
 Embeddings already run locally. Replace `ChatGroq` with `ChatOllama` (local Llama via Ollama) and nothing leaves the machine.
+📌 *Constraint: a local LLM needs significant RAM/CPU (or GPU) — well beyond the 512 MB free tier.*
 
 **Q: What are the main libraries?**
 Next.js (app + API), LangChain (splitter, vector store, prompt/LLM chaining), transformers.js (local embeddings), pdf-parse (PDF text), Tailwind (UI).
+📌 *Constraint: `@huggingface/transformers` is heavy + native — it's why this can't run on Vercel's serverless functions.*
 
 **Q: What's the single most important file?**
 `lib/store.ts` for indexing+retrieval and `app/api/chat/route.ts` for the prompt+LLM. `lib/embeddings.ts` is the local model.
+📌 *Constraint: the tuning knobs (chunk size, overlap, `k`, temperature, model) all live in these three files.*
 
 **Q: How accurate is it?**
 As accurate as retrieval + the source text. If the answer is in the document and lands in the top-5 chunks, it's reliable. If retrieval misses it, the answer may be incomplete — tunable via chunk size and `k`.
+📌 *Constraint: accuracy ceiling = retrieval quality (k=5, 1,000-char chunks) + the LLM; no ground-truth verification step.*
+
+**Q: Why can't this run on Vercel?**
+Vercel is serverless: `/api/ingest` and `/api/chat` run as separate, stateless functions, so the in-memory vectors from upload aren't visible at chat time; and the local embedding model needs a writable disk + native runtime that serverless doesn't provide. It needs a persistent server (Render/Railway) — or a serverless refactor (e.g. Upstash Vector).
+📌 *Constraint: architecture assumes one long-lived process with shared memory + disk.*
 
 ---
 
