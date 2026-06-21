@@ -4,6 +4,14 @@
 
 Built with **Next.js (App Router)** and **LangChain**, using **100% free models** — no paid API keys, no cloud database, no credit card.
 
+### 🌐 Live demo
+
+**→ https://pdf-chatbot-u7ej.onrender.com**
+
+> Hosted on Render's free tier, so the instance sleeps when idle — the **first
+> visit may take ~30–50 s** to wake up and load the embedding model. It's fast
+> after that.
+
 ---
 
 ## ✨ Features
