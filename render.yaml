@@ -1,0 +1,24 @@
+# Render Blueprint — deploys this app as a persistent Node web service.
+# In the Render dashboard: New > Blueprint > connect this repo. Render reads
+# this file automatically. Then set GROQ_API_KEY (marked sync:false below).
+services:
+  - type: web
+    name: pdf-chatbot
+    runtime: node
+    plan: free
+    # .npmrc sets legacy-peer-deps=true, so a plain install works.
+    buildCommand: npm install && npm run build
+    startCommand: npm run start
+    healthCheckPath: /
+    autoDeploy: true
+    envVars:
+      # Paste your free Groq key in the Render dashboard (not committed here).
+      - key: GROQ_API_KEY
+        sync: false
+      - key: NODE_VERSION
+        value: 20.18.0
+      # Optional overrides (uncomment to change):
+      # - key: GROQ_MODEL
+      #   value: llama-3.3-70b-versatile
+      # - key: EMBEDDING_MODEL
+      #   value: Xenova/all-MiniLM-L6-v2
